@@ -3,7 +3,7 @@
 -- https://www.phpmyadmin.net/
 --
 -- Host: 127.0.0.1
--- Generation Time: Aug 07, 2024 at 05:04 AM
+-- Generation Time: Aug 08, 2024 at 01:33 PM
 -- Server version: 10.4.32-MariaDB
 -- PHP Version: 8.2.12
 
@@ -53,6 +53,47 @@ CREATE DEFINER=`root`@`localhost` PROCEDURE `get_active_rents` ()   BEGIN
     JOIN heavequip_rentalsys.customers c ON ar.CustomerID = c.CustomerID;
 END$$
 
+CREATE DEFINER=`root`@`localhost` PROCEDURE `update_active_rents` ()   BEGIN
+    DECLARE done INT DEFAULT 0;
+    DECLARE ru_customerID INT;
+    DECLARE ru_employeeID INT;
+    DECLARE ru_rentalStartDate DATE;
+    DECLARE ru_rentalEndDate DATE;
+    DECLARE ru_totalCost DECIMAL(10, 2);
+    DECLARE ru_equipmentType VARCHAR(100);
+
+    DECLARE cur CURSOR FOR 
+    SELECT customerID, employeeID, rentalStartDate, rentalEndDate, totalCost, equipmentType 
+    FROM heavequip_rentalsys.rental_updates;
+    
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+
+    OPEN cur;
+    read_loop: LOOP
+        FETCH cur INTO ru_customerID, ru_employeeID, ru_rentalStartDate, ru_rentalEndDate, ru_totalCost, ru_equipmentType;
+        IF done THEN
+            LEAVE read_loop;
+        END IF;
+
+        -- Update underlying tables logic here
+        -- For example, if active_rents is based on orders and orderequipment tables:
+        UPDATE heavequip_rentalsys.orders
+        SET RentalEndDate = ru_rentalEndDate, TotalCost = ru_totalCost
+        WHERE CustomerID = ru_customerID AND EmployeeID = ru_employeeID AND RentalStartDate = ru_rentalStartDate;
+
+        UPDATE heavequip_rentalsys.orderequipment
+        SET EquipmentType = ru_equipmentType
+        WHERE OrderID IN (SELECT OrderID FROM heavequip_rentalsys.orders
+                          WHERE CustomerID = ru_customerID AND EmployeeID = ru_employeeID AND RentalStartDate = ru_rentalStartDate);
+
+    END LOOP;
+
+    CLOSE cur;
+
+    -- Clear the rental_updates table after processing
+    TRUNCATE TABLE heavequip_rentalsys.rental_updates;
+END$$
+
 DELIMITER ;
 
 -- --------------------------------------------------------
@@ -62,11 +103,10 @@ DELIMITER ;
 -- (See below for the actual view)
 --
 CREATE TABLE `active_rents` (
-`Customer's Name` varchar(101)
-,`Employee's name in charge` varchar(101)
+`Customer's Name` varchar(50)
+,`Employee's Name in charge` varchar(50)
 ,`Rent Start Date` date
 ,`Rent End Date` date
-,`Total Cost` decimal(10,2)
 ,`Rented Equipment` varchar(100)
 );
 
@@ -121,7 +161,9 @@ INSERT INTO `customers` (`CustomerID`, `FirstName`, `LastName`, `CompanyName`, `
 (1, 'Aishi', 'Terunia', 'Crystalshine inc.', 'Newberry, Michigan, United States', '(989) 555-9874', 'aishi_teru10@gmail.com'),
 (2, 'Layleson', 'Law', 'Visionetworks co.', 'San Jose, California, United States', '(209) 555-4561', 'laylesonlaw@gmail.com'),
 (3, 'Jayce', 'Shinyuu', 'Grand Chasm Mining Group', 'Kilkenny, Leinster, Ireland', '+353 147258', 'jayc33_cuti3@gmail.com'),
-(4, 'Athena', 'Prescott', 'l\'Arène du Faux', 'Marseille, Provence-Alpes-Côte d\'Azur, France', '+33 69852147', 'Prescottathena@yahoo.com');
+(4, 'Athena', 'Prescott', 'l\'Arène du Faux', 'Marseille, Provence-Alpes-Côte d\'Azur, France', '+33 69852147', 'Prescottathena@yahoo.com'),
+(9, 'Sage', 'Petrov', 'House of Petrov', 'Venice, Italy', '1234567890', 'sagepetrov@gmail.com'),
+(10, 'Sage', 'Petrov', 'House of Petrov', 'Venice, Italy', '1234567890', 'sagepetrov@gmail.com');
 
 -- --------------------------------------------------------
 
@@ -227,11 +269,55 @@ INSERT INTO `orders` (`OrderID`, `CustomerID`, `EmployeeID`, `RentalStartDate`, 
 (2, 2, 2, '2024-07-29', '2024-08-12', 10000.00, '0000-00-00', 1),
 (3, 2, 2, '2024-07-29', '2024-08-12', 4800.00, '0000-00-00', 1),
 (4, 3, 1, '2024-07-11', '2024-07-25', 7000.00, '0000-00-00', 1),
-(5, 4, 1, '2024-06-02', '2024-08-04', 5400.00, '0000-00-00', 1);
+(5, 4, 1, '2024-06-02', '2024-08-04', 5400.00, '0000-00-00', 1),
+(18, 9, 1, '2024-08-08', '2024-08-15', NULL, '0000-00-00', 1),
+(19, 9, 1, '2024-08-08', '2024-08-15', NULL, '0000-00-00', 1);
 
 --
 -- Triggers `orders`
 --
+DELIMITER $$
+CREATE TRIGGER `after_insert_order` AFTER INSERT ON `orders` FOR EACH ROW BEGIN
+    DECLARE equipment_type VARCHAR(100);
+
+    -- Get Equipment Type
+    SELECT EquipmentType INTO equipment_type
+    FROM heavequip_rentalsys.orderequipment
+    JOIN heavequip_rentalsys.equipment
+    ON heavequip_rentalsys.orderequipment.EquipmentID = heavequip_rentalsys.equipment.EquipmentID
+    WHERE OrderID = NEW.OrderID;
+
+    -- Insert into rental_updates table
+    INSERT INTO heavequip_rentalsys.rental_updates (customerID, employeeID, rentalStartDate, rentalEndDate, totalCost, equipmentType)
+    VALUES (NEW.CustomerID, NEW.EmployeeID, NEW.RentalStartDate, NEW.RentalEndDate, NEW.TotalCost, equipment_type);
+END
+$$
+DELIMITER ;
+DELIMITER $$
+CREATE TRIGGER `after_order_delete` AFTER DELETE ON `orders` FOR EACH ROW BEGIN
+    DECLARE equipment_id INT;
+    DECLARE done INT DEFAULT 0;
+    DECLARE equipment_cursor CURSOR FOR 
+        SELECT EquipmentID FROM heavequip_rentalsys.orderequipment WHERE OrderID = OLD.OrderID;
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+
+    OPEN equipment_cursor;
+
+    read_loop: LOOP
+        FETCH equipment_cursor INTO equipment_id;
+        IF done THEN
+            LEAVE read_loop;
+        END IF;
+
+        UPDATE heavequip_rentalsys.equipment
+        SET AvailabilityStatus = 1
+        WHERE EquipmentID = equipment_id;
+    END LOOP;
+
+    CLOSE equipment_cursor;
+END
+$$
+DELIMITER ;
 DELIMITER $$
 CREATE TRIGGER `after_order_insert` AFTER INSERT ON `orders` FOR EACH ROW BEGIN
     DECLARE equipment_id INT;
@@ -287,6 +373,45 @@ CREATE TABLE `rentals_date` (
 ,`Due Date` date
 ,`Employee in charge` varchar(101)
 );
+
+-- --------------------------------------------------------
+
+--
+-- Stand-in structure for view `rental_report`
+-- (See below for the actual view)
+--
+CREATE TABLE `rental_report` (
+`Report Title` varchar(50)
+,`Generated Date` date
+,`Content` text
+,`Employee's Name` varchar(101)
+,`Role` varchar(50)
+);
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `rental_updates`
+--
+
+CREATE TABLE `rental_updates` (
+  `id` int(11) NOT NULL,
+  `customerID` int(11) DEFAULT NULL,
+  `employeeID` int(11) DEFAULT NULL,
+  `rentalStartDate` date DEFAULT NULL,
+  `rentalEndDate` date DEFAULT NULL,
+  `totalCost` decimal(10,2) DEFAULT NULL,
+  `equipmentType` varchar(100) DEFAULT NULL,
+  `createdAt` timestamp NOT NULL DEFAULT current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+--
+-- Dumping data for table `rental_updates`
+--
+
+INSERT INTO `rental_updates` (`id`, `customerID`, `employeeID`, `rentalStartDate`, `rentalEndDate`, `totalCost`, `equipmentType`, `createdAt`) VALUES
+(1, 9, 1, '2024-08-08', '2024-08-15', NULL, NULL, '2024-08-08 08:39:32'),
+(2, 9, 1, '2024-08-08', '2024-08-15', NULL, NULL, '2024-08-08 08:39:53');
 
 -- --------------------------------------------------------
 
@@ -389,7 +514,7 @@ CREATE TABLE `users` (
 --
 DROP TABLE IF EXISTS `active_rents`;
 
-CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `active_rents`  AS SELECT concat(`customers`.`FirstName`,' ',`customers`.`LastName`) AS `Customer's Name`, concat(`employees`.`FirstName`,' ',`employees`.`LastName`) AS `Employee's name in charge`, `orders`.`RentalStartDate` AS `Rent Start Date`, `orders`.`RentalEndDate` AS `Rent End Date`, `orders`.`TotalCost` AS `Total Cost`, `equipment`.`EquipmentType` AS `Rented Equipment` FROM ((((`orderequipment` join `orders` on(`orders`.`OrderID` = `orderequipment`.`OrderID`)) join `equipment` on(`equipment`.`EquipmentID` = `orderequipment`.`EquipmentID`)) join `customers` on(`customers`.`CustomerID` = `orders`.`CustomerID`)) join `employees` on(`employees`.`EmployeeID` = `orders`.`EmployeeID`)) WHERE `orders`.`Status` = 1 ORDER BY `orders`.`OrderID` ASC ;
+CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `active_rents`  AS SELECT `c`.`FirstName` AS `Customer's Name`, `e`.`FirstName` AS `Employee's Name in charge`, `o`.`RentalStartDate` AS `Rent Start Date`, `o`.`RentalEndDate` AS `Rent End Date`, `eq`.`EquipmentType` AS `Rented Equipment` FROM ((((`orders` `o` join `customers` `c` on(`o`.`CustomerID` = `c`.`CustomerID`)) join `employees` `e` on(`o`.`EmployeeID` = `e`.`EmployeeID`)) join `orderequipment` `oe` on(`o`.`OrderID` = `oe`.`OrderID`)) join `equipment` `eq` on(`oe`.`EquipmentID` = `eq`.`EquipmentID`)) WHERE `o`.`Status` = 1 ;
 
 -- --------------------------------------------------------
 
@@ -417,6 +542,15 @@ CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW 
 DROP TABLE IF EXISTS `rentals_date`;
 
 CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `rentals_date`  AS SELECT concat(`customers`.`FirstName`,' ',`customers`.`LastName`) AS `Customer name`, `customers`.`CompanyName` AS `Company name`, `equipment`.`EquipmentType` AS `Rented Equipment`, `orders`.`RentalStartDate` AS `Rented Date`, `orders`.`RentalEndDate` AS `Due Date`, concat(`employees`.`FirstName`,' ',`employees`.`LastName`) AS `Employee in charge` FROM ((((`orderequipment` join `orders` on(`orders`.`OrderID` = `orderequipment`.`OrderID`)) join `equipment` on(`equipment`.`EquipmentID` = `orderequipment`.`EquipmentID`)) join `customers` on(`customers`.`CustomerID` = `orders`.`CustomerID`)) join `employees` on(`employees`.`EmployeeID` = `orders`.`EmployeeID`)) ORDER BY `orders`.`OrderID` ASC ;
+
+-- --------------------------------------------------------
+
+--
+-- Structure for view `rental_report`
+--
+DROP TABLE IF EXISTS `rental_report`;
+
+CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `rental_report`  AS SELECT `reports`.`ReportType` AS `Report Title`, `reports`.`GeneratedDate` AS `Generated Date`, `reports`.`Content` AS `Content`, concat(`employees`.`FirstName`,' ',`employees`.`LastName`) AS `Employee's Name`, `employees`.`Role` AS `Role` FROM (`reports` join `employees`) WHERE `reports`.`ReportType` = 'Rental Report' ;
 
 --
 -- Indexes for dumped tables
@@ -455,6 +589,12 @@ ALTER TABLE `orders`
   ADD PRIMARY KEY (`OrderID`),
   ADD KEY `CustomerID` (`CustomerID`),
   ADD KEY `EmployeeID` (`EmployeeID`);
+
+--
+-- Indexes for table `rental_updates`
+--
+ALTER TABLE `rental_updates`
+  ADD PRIMARY KEY (`id`);
 
 --
 -- Indexes for table `reports`
@@ -496,7 +636,7 @@ ALTER TABLE `users`
 -- AUTO_INCREMENT for table `customers`
 --
 ALTER TABLE `customers`
-  MODIFY `CustomerID` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=5;
+  MODIFY `CustomerID` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=12;
 
 --
 -- AUTO_INCREMENT for table `employees`
@@ -514,7 +654,13 @@ ALTER TABLE `equipment`
 -- AUTO_INCREMENT for table `orders`
 --
 ALTER TABLE `orders`
-  MODIFY `OrderID` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=16;
+  MODIFY `OrderID` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=20;
+
+--
+-- AUTO_INCREMENT for table `rental_updates`
+--
+ALTER TABLE `rental_updates`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=3;
 
 --
 -- AUTO_INCREMENT for table `reports`
@@ -570,6 +716,16 @@ ALTER TABLE `orders`
 ALTER TABLE `userroles`
   ADD CONSTRAINT `userroles_ibfk_1` FOREIGN KEY (`UserID`) REFERENCES `users` (`UserID`),
   ADD CONSTRAINT `userroles_ibfk_2` FOREIGN KEY (`RoleID`) REFERENCES `roles` (`RoleID`);
+
+DELIMITER $$
+--
+-- Events
+--
+CREATE DEFINER=`root`@`localhost` EVENT `run_update_active_rents` ON SCHEDULE EVERY 5 MINUTE STARTS '2024-08-08 16:38:44' ON COMPLETION NOT PRESERVE ENABLE DO BEGIN
+    CALL update_active_rents();
+END$$
+
+DELIMITER ;
 COMMIT;
 
 /*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;
